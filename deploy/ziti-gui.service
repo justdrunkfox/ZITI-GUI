@@ -1,0 +1,12 @@
+[Unit]
+Description=Ziti tunnel tray GUI
+
+[Service]
+Type=simple
+ExecStart=/home/fox/Nextcloud/Proj/personal/ziti-gui/ziti-gui
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target
