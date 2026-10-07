@@ -503,7 +503,7 @@ func (a *app) identityCard(gtx layout.Context, th *material.Theme, ui *windowSta
 	sw := ui.switchFor(id)
 	if changed := sw.Update(gtx); changed {
 		go a.toggleIdent(id.Name, sw.Value)
-	} else if sw.Value != id.Enabled {
+	} else if sw.Value != id.Enabled && !a.togglePending(id.Name) {
 		sw.Value = id.Enabled
 	}
 	card := ui.cardFor(id)

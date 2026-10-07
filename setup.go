@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -44,8 +45,28 @@ func (a *app) needSetup(st Status) bool {
 	return st.Svc == SvcActive && !st.IpcOK
 }
 
+// allowedIdentityDir — каталог идентичностей, который допустимо отдавать
+// root-скрипту настройки: пакетный путь по умолчанию или что-то внутри $HOME.
+func (a *app) allowedIdentityDir() bool {
+	if dir, err := filepath.Abs(a.cfg.IdentityDir); err == nil {
+		if dir == "/opt/openziti/etc/identities" {
+			return true
+		}
+		if home, herr := os.UserHomeDir(); herr == nil &&
+			strings.HasPrefix(dir, home+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *app) runSetup() {
 	a.once("setup", func() {
+		if !a.allowedIdentityDir() {
+			notify("Ziti: настройка отменена",
+				"Подозрительный identity_dir в конфиге: "+a.cfg.IdentityDir)
+			return
+		}
 		me, err := user.Current()
 		if err != nil {
 			notify("Ziti: настройка не удалась", err.Error())

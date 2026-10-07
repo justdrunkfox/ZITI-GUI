@@ -76,7 +76,7 @@ func portalChooseFile(title string) (string, error) {
 	}
 	log.Printf("portal: диалог открыт, handle=%s", handle)
 
-	deadline := time.After(5 * time.Minute)
+	deadline := time.After(90 * time.Second)
 	for {
 		select {
 		case sig := <-sigCh:

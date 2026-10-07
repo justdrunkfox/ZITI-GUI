@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -440,8 +441,11 @@ type app struct {
 	jobs     sync.Map        // однократные полёты действий
 	delArmed map[string]bool // подтверждённое удаление (двухшаговое)
 
-	missingSince map[string]time.Time // pid/файл -> с каких пор контекст отсутствует
-	recoverTried map[string]string    // файл -> MainPID сервиса, для которого уже пробовали
+	enrollBusy     atomic.Bool          // диалог/процесс регистрации уже идёт
+	missingSince   map[string]time.Time // pid/файл -> с каких пор контекст отсутствует
+	recoverTried   map[string]string    // файл -> MainPID сервиса, для которого уже пробовали
+	applyOffAt     map[string]time.Time // имя -> когда последний раз применяли "выкл"
+	pendingToggles map[string]time.Time // имя -> когда последний раз кликнули тоггл
 
 	updateCh chan struct{}
 	quit     func()
@@ -467,8 +471,14 @@ func (a *app) poll() Status {
 	ctx := context.Background()
 	st := Status{Fetched: time.Now()}
 
-	out, _ := a.systemctl(ctx, "is-active", a.cfg.Service)
-	switch strings.TrimSpace(out) {
+	// один вызов вместо двух: ActiveState и MainPID
+	out, _ := a.systemctl(ctx, "show", "-p", "ActiveState", "-p", "MainPID", "--value", a.cfg.Service)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	activeState := lines[0]
+	if len(lines) > 1 {
+		st.PID = strings.TrimSpace(lines[1])
+	}
+	switch activeState {
 	case "active":
 		st.Svc = SvcActive
 	case "activating", "reloading":
@@ -479,10 +489,6 @@ func (a *app) poll() Status {
 		st.Svc = SvcInactive
 	default:
 		st.Svc = SvcUnknown
-	}
-
-	if pid, err := a.systemctl(ctx, "show", "-p", "MainPID", "--value", a.cfg.Service); err == nil {
-		st.PID = strings.TrimSpace(pid)
 	}
 	st.SvcUser = a.svcUser()
 
@@ -515,8 +521,24 @@ func (a *app) poll() Status {
 		}
 		a.mu.Unlock()
 		if off {
-			key := "apply-off:" + id.Name
-			a.once(key, a.applyPersistedDisables)
+			a.mu.Lock()
+			last, seen := a.applyOffAt[id.Name]
+			if !seen {
+				if a.applyOffAt == nil {
+					a.applyOffAt = map[string]time.Time{}
+				}
+				a.applyOffAt[id.Name] = time.Time{}
+				seen = true
+			}
+			now := time.Now()
+			throttled := seen && !last.IsZero() && now.Sub(last) < 60*time.Second
+			if !throttled {
+				a.applyOffAt[id.Name] = now
+			}
+			a.mu.Unlock()
+			if !throttled {
+				go a.applyPersistedDisables(st)
+			}
 		}
 	}
 
@@ -527,7 +549,7 @@ func (a *app) poll() Status {
 
 	// туннелер только что поднялся — применяем сохранённые вкл/выкл
 	if st.IpcOK && (!prev.IpcOK || prev.Svc != SvcActive) {
-		go a.applyPersistedDisables()
+		go a.applyPersistedDisables(st)
 	}
 	// зависшие при старте контексты (файл есть, в dump нет) — переинициируем
 	a.maybeRecoverMissing(st)
@@ -663,6 +685,21 @@ func (a *app) identArg(name string) string {
 	return name
 }
 
+// togglePending — по имени не так давно кликали тоггл: не синхронизировать
+// переключатель с состоянием туннелера, чтобы он не «мигал» обратно.
+func (a *app) togglePending(name string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	t, ok := a.pendingToggles[name]
+	return ok && time.Since(t) < 5*time.Second
+}
+
+func (a *app) clearTogglePending(name string) {
+	a.mu.Lock()
+	delete(a.pendingToggles, name)
+	a.mu.Unlock()
+}
+
 // zitiIPCError проверяет ответ клиентской команды: CLI завершается с кодом 0
 // даже при ошибке, статус надо читать из JSON ("Success":false).
 func zitiIPCError(out string, err error) string {
@@ -761,6 +798,7 @@ func (a *app) toggleIdent(name string, enable bool) {
 			if msg := zitiIPCError(out, err); msg != "" && !strings.Contains(msg, "not found") {
 				log.Printf("toggle %s: FAIL %s", name, msg)
 				notify("Ziti: не удалось загрузить", msg+" — попробуйте позже или перезапустите сервис")
+				a.clearTogglePending(name)
 				a.requestUpdate()
 				return
 			}
@@ -795,10 +833,12 @@ func (a *app) toggleIdent(name string, enable bool) {
 		if msg := zitiIPCError(out, err); msg != "" {
 			log.Printf("toggle %s -> %s: FAIL %s", name, arg, msg)
 			notify("Ziti: переключение не применено", msg)
+			a.clearTogglePending(name)
 			a.requestUpdate()
 			return
 		}
 		log.Printf("toggle %s -> %s: ok", name, arg)
+		a.clearTogglePending(name)
 	} else if cur.Svc == SvcActive {
 		notify("Ziti", "Нет доступа к IPC: состояние применится после перезапуска сервиса")
 	}
@@ -832,8 +872,7 @@ func fileBase(path string) string {
 }
 
 // applyPersistedDisables — после старта туннелера выключаем то, что выключено в конфиге.
-func (a *app) applyPersistedDisables() {
-	st := a.poll()
+func (a *app) applyPersistedDisables(st Status) {
 	if !st.IpcOK {
 		return
 	}
@@ -844,17 +883,21 @@ func (a *app) applyPersistedDisables() {
 			off = true
 		}
 		a.mu.Unlock()
-		if off && id.Enabled {
-			ident := id.File
-			if ident == "" {
-				ident = id.Name
-			}
-			out, err := a.zitiClient(context.Background(), 10*time.Second,
-				"on_off_identity", "-i", ident, "-o", "f")
-			if zitiIPCError(out, err) == "" {
-				log.Printf("apply persisted disable: %s", id.Name)
-				notify("Ziti", "Идентичность «"+id.Name+"» выключена (сохранённое состояние)")
-			}
+		if !off || !id.Enabled {
+			continue
+		}
+		ident := id.File
+		if ident == "" {
+			ident = id.Name
+		}
+		out, err := a.zitiClient(context.Background(), 10*time.Second,
+			"on_off_identity", "-i", ident, "-o", "f")
+		if zitiIPCError(out, err) == "" {
+			log.Printf("apply persisted disable: %s", id.Name)
+			notify("Ziti", "Идентичность «"+id.Name+"» выключена (сохранённое состояние)")
+			a.clearTogglePending(id.Name)
+		} else {
+			log.Printf("apply persisted disable %s: FAIL %s", id.Name, zitiIPCError(out, err))
 		}
 	}
 	a.requestUpdate()
@@ -896,15 +939,26 @@ func (a *app) refreshIdent(name string) {
 
 // deleteIdent — двухшаговое: первый клик ставит «взвод», второй — удаляет.
 func (a *app) deleteIdent(id Ident) {
+	a.mu.Lock()
 	if !a.delArmed[id.Name] {
 		a.delArmed[id.Name] = true
+		a.mu.Unlock()
+		// снимаем "взвод" через минуту, если передумали
+		time.AfterFunc(time.Minute, func() {
+			a.mu.Lock()
+			delete(a.delArmed, id.Name)
+			a.mu.Unlock()
+			a.requestUpdate()
+		})
 		a.requestUpdate()
 		return
 	}
 	delete(a.delArmed, id.Name)
+	cur := a.cur
+	a.mu.Unlock()
 	a.once("del:"+id.Name, func() {
 		var msgs []string
-		if a.cur.IpcOK {
+		if cur.IpcOK {
 			out, err := a.zitiClient(context.Background(), 15*time.Second, "delete", "-i", a.identArg(id.Name))
 			if msg := zitiIPCError(out, err); msg != "" && !strings.Contains(msg, "not found") {
 				msgs = append(msgs, msg)

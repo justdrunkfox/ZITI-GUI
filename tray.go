@@ -40,12 +40,13 @@ func (a *app) pollLoop() {
 		case <-a.updateCh: // действие просит обновиться побыстрее
 		}
 		a.poll()
-		a.rebuildIfChanged()
-		invalidateWindow()
+		if a.rebuildIfChanged() {
+			invalidateWindow()
+		}
 	}
 }
 
-func (a *app) rebuildIfChanged() {
+func (a *app) rebuildIfChanged() bool {
 	a.mu.Lock()
 	cur := a.cur
 	armed := make([]string, 0, len(a.delArmed))
@@ -57,10 +58,11 @@ func (a *app) rebuildIfChanged() {
 
 	sig := cur.key() + "|" + strings.Join(armed, ",")
 	if sig == a.ver {
-		return
+		return false
 	}
 	a.ver = sig
 	a.buildMenu(cur)
+	return true
 }
 
 // ---------------------------------------------------------------------- меню
@@ -103,7 +105,7 @@ func (a *app) buildMenu(st Status) {
 
 	systray.AddSeparator()
 	mEnroll := systray.AddMenuItem("Зарегистрировать JWT…", "Выбрать JWT-файл и выполнить enrollment")
-	onClick(mEnroll, func() { a.once("enroll", a.enrollFlow) })
+	onClick(mEnroll, a.enrollFlow)
 
 	if a.needSetup(st) {
 		mSetup := systray.AddMenuItem("⚙ Настроить доступ (пароль один раз)",
@@ -204,7 +206,10 @@ func (a *app) buildIdentitiesMenu(st Status) {
 
 		sub.AddSeparator()
 		delTitle := "Удалить…"
-		if a.delArmed[id.Name] {
+		a.mu.Lock()
+		armed := a.delArmed[id.Name]
+		a.mu.Unlock()
+		if armed {
 			delTitle = "⚠ Точно удалить «" + id.Name + "»?"
 		}
 		del := sub.AddSubMenuItem(delTitle, "Удалить из туннелера и стереть файл")
@@ -307,6 +312,11 @@ func (a *app) identDetail(id Ident) string {
 // ------------------------------------------------------------ enrollment
 
 func (a *app) enrollFlow() {
+	if !a.enrollBusy.CompareAndSwap(false, true) {
+		notify("Ziti", "Диалог регистрации уже открыт")
+		return
+	}
+	defer a.enrollBusy.Store(false)
 	log.Printf("enroll: старт")
 	path, err := pickFileForEnroll("Выберите enrollment JWT")
 	if err != nil {
