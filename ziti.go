@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -27,16 +26,15 @@ func (a *app) systemctl(ctx context.Context, args ...string) (string, error) {
 	return runCmd(ctx, "systemctl", args...)
 }
 
-// systemctl через pkexec — start/stop/restart требуют polkit-авторизацию
-// (после «Настроить доступ» срабатывает правило и пароль не спрашивается).
+// systemctlPriv — start/stop/restart напрямую от имени пользователя:
+// systemd проверит polkit-правило (org.freedesktop.systemd1.manage-units)
+// и после «Настроить доступ» пропустит без пароля. Оборачивать в pkexec
+// нельзя: pkexec проверяет СВОЁ действие (policykit.exec) и просит пароль
+// всегда, игнорируя правило.
 func (a *app) systemctlPriv(ctx context.Context, args ...string) (string, error) {
-	if _, err := exec.LookPath("pkexec"); err != nil {
-		return "", errors.New("pkexec не найден в системе")
-	}
 	c, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	full := append([]string{"systemctl"}, args...)
-	cmd := exec.CommandContext(c, "pkexec", full...)
+	cmd := exec.CommandContext(c, "systemctl", args...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

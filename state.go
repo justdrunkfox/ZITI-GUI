@@ -471,23 +471,32 @@ func (a *app) poll() Status {
 	ctx := context.Background()
 	st := Status{Fetched: time.Now()}
 
-	// один вызов вместо двух: ActiveState и MainPID
-	out, _ := a.systemctl(ctx, "show", "-p", "ActiveState", "-p", "MainPID", "--value", a.cfg.Service)
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	activeState := lines[0]
-	if len(lines) > 1 {
-		st.PID = strings.TrimSpace(lines[1])
+	// один вызов вместо двух; парсим "Ключ=Значение" — systemctl выводит
+	// свойства в своём порядке, позиционный разбор тут ломается
+	out, _ := a.systemctl(ctx, "show", "-p", "ActiveState", "-p", "MainPID", a.cfg.Service)
+	for _, ln := range strings.Split(out, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(ln), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "ActiveState":
+			st.Svc = SvcUnknown
+			switch strings.TrimSpace(v) {
+			case "active":
+				st.Svc = SvcActive
+			case "activating", "reloading":
+				st.Svc = SvcActivating
+			case "failed":
+				st.Svc = SvcFailed
+			case "inactive", "maintenance", "degrading":
+				st.Svc = SvcInactive
+			}
+		case "MainPID":
+			st.PID = strings.TrimSpace(v)
+		}
 	}
-	switch activeState {
-	case "active":
-		st.Svc = SvcActive
-	case "activating", "reloading":
-		st.Svc = SvcActivating
-	case "failed":
-		st.Svc = SvcFailed
-	case "inactive", "maintenance", "degrading":
-		st.Svc = SvcInactive
-	default:
+	if st.Svc == "" {
 		st.Svc = SvcUnknown
 	}
 	st.SvcUser = a.svcUser()
